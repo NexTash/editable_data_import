@@ -18,7 +18,7 @@ from frappe.tests import IntegrationTestCase
 from frappe.utils.file_manager import save_file
 from frappe.utils.xlsxutils import make_xlsx
 
-from editable_data_import.api import editable_import
+from editable_data_import.api import editable_import, validation
 
 ITEM_GROUP = "All Item Groups"
 UOM = "Nos"
@@ -106,6 +106,12 @@ class EditableImportTestCase(IntegrationTestCase):
 		self.assertTrue(core_preview["max_rows_exceeded"])
 
 	def test_validation_pins_errors_to_the_right_cell(self):
+		"""An invalid Link value must land on its cell, not just on its column.
+
+		Core reports this as one column-level ``value_mapping`` warning with the
+		row numbers written into the message text, so the coordinates have to be
+		recovered from the column's invalid items.
+		"""
 		self.cleanup_items("EDIV")
 		rows = self.simple_rows("EDIV", 3)
 		rows[2][2] = "NO_SUCH_ITEM_GROUP"
@@ -113,13 +119,47 @@ class EditableImportTestCase(IntegrationTestCase):
 
 		preview = editable_import.get_editable_preview(data_import.name)
 		group_column = self.grid_column(preview, "item_group")
-		coordinates = {(e["position"], e.get("column")) for e in preview["validation"]["cell_errors"]}
+		cell_errors = preview["validation"]["cell_errors"]
+		coordinates = {(e["position"], e.get("column")) for e in cell_errors}
 
 		self.assertIn((1, group_column), coordinates)
-		self.assertGreater(preview["validation"]["blocking_count"], 0)
+		self.assertNotIn((0, group_column), coordinates)
+		self.assertNotIn((2, group_column), coordinates)
 
-	def test_non_numeric_value_is_reported_rather_than_silently_zeroed(self):
-		"""flt("abc") is 0.0 in core, with no warning anywhere."""
+		# The column warning is what counts; its cell locators must not inflate
+		# the tally beyond what core's own gate would refuse on.
+		self.assertEqual(preview["validation"]["blocking_count"], 1)
+
+	def test_a_mapped_value_stops_marking_its_cell(self):
+		"""Once Fix Issues maps the value, core stops blocking and so must the grid."""
+		self.cleanup_items("EDIQ")
+		rows = self.simple_rows("EDIQ", 2)
+		rows[1][2] = "NO_SUCH_ITEM_GROUP"
+		data_import, _ = self.make_import("ediq.csv", csv_content(rows))
+
+		blocked = editable_import.get_editable_preview(data_import.name)
+		self.assertGreater(blocked["validation"]["blocking_count"], 0)
+		self.assertTrue(blocked["validation"]["cell_errors"])
+
+		data_import.reload()
+		for mapping in data_import.value_mappings:
+			if mapping.source_value == "NO_SUCH_ITEM_GROUP":
+				mapping.target_value = ITEM_GROUP
+		data_import.save()
+		frappe.db.commit()
+
+		cleared = editable_import.get_editable_preview(data_import.name)
+		self.assertEqual(cleared["validation"]["blocking_count"], 0)
+		self.assertEqual(cleared["validation"]["cell_errors"], [])
+
+	def test_unparseable_number_is_reported_once(self):
+		"""Core gained its own per-cell number check; the app must not double up.
+
+		``abc`` in a Currency column used to pass core's parse layer untouched,
+		which is why the gap-filling layer exists. Core now reports it as a
+		blocking error, so the advisory "will be imported as 0" note would
+		contradict it on the same cell.
+		"""
 		self.cleanup_items("EDIN")
 		rows = [["ID", "Item Name", "Item Group", "Default Unit of Measure", "Valuation Rate"]]
 		rows.append(["EDIN-001", "Numeric", ITEM_GROUP, UOM, "abc"])
@@ -133,9 +173,29 @@ class EditableImportTestCase(IntegrationTestCase):
 			if e["position"] == 0 and e.get("column") == rate_column
 		]
 
-		self.assertTrue(flagged)
+		self.assertEqual(len(flagged), 1)
+		self.assertEqual(flagged[0]["severity"], "error")
+		self.assertGreater(preview["validation"]["blocking_count"], 0)
+
+	def test_integer_truncation_is_reported_rather_than_silently_zeroed(self):
+		"""cint("0.5") is 0, and core's number check reads 0.5 as a valid number."""
+		self.cleanup_items("EDIT")
+		rows = [["ID", "Item Name", "Item Group", "Default Unit of Measure", "Lead Time in days"]]
+		rows.append(["EDIT-001", "Truncated", ITEM_GROUP, UOM, "0.5"])
+		data_import, _ = self.make_import("edit.csv", csv_content(rows))
+
+		preview = editable_import.get_editable_preview(data_import.name)
+		lead_column = self.grid_column(preview, "lead_time_days")
+		flagged = [
+			e
+			for e in preview["validation"]["cell_errors"]
+			if e["position"] == 0 and e.get("column") == lead_column
+		]
+
+		self.assertEqual(len(flagged), 1)
 		# Advisory only: core would import this, so the app must not block it.
 		self.assertEqual(flagged[0]["severity"], "warning")
+		self.assertEqual(preview["validation"]["blocking_count"], 0)
 
 	def test_validation_writes_nothing(self):
 		self.cleanup_items("EDIW")
@@ -336,3 +396,171 @@ class EditableImportTestCase(IntegrationTestCase):
 		self.assertEqual(
 			json.loads(data_import.template_options).get("column_to_field_map"), {"1": "item_name"}
 		)
+
+	# ------------------------------------------- regressions from code review
+
+	def test_editing_does_not_break_validation(self):
+		"""The edited dataset must parse under the same settings as the source.
+
+		``parse_data_from_template`` reads ``value_lookup``, ``reference_doctype``,
+		``column_to_date_format_map`` and ``tree_parent_overrides`` off the
+		ImportFile. An edited ImportFile built from a hand-written attribute list
+		loses whichever of those core added most recently and raises
+		AttributeError here instead of validating.
+		"""
+		self.cleanup_items("EDIA")
+		data_import, _ = self.make_import("edia.csv", csv_content(self.simple_rows("EDIA", 3)))
+
+		preview = editable_import.get_editable_preview(data_import.name)
+		name_index = self.grid_column(preview, "item_name") - 1
+		edits = json.dumps({"0": {str(name_index): "Edited Before Validation"}})
+
+		shallow = editable_import.validate_edits(data_import.name, edits)
+		self.assertEqual(shallow["total_rows"], 3)
+		self.assertEqual(shallow["blocking_count"], 0)
+
+		deep = editable_import.validate_edits(data_import.name, edits, deep=1)
+		self.assertIsNotNone(deep["deep"])
+		self.assertEqual(deep["deep"]["checked"], 3)
+		self.assertEqual(deep["deep_error_count"], 0)
+		self.assertEqual(frappe.db.count("Item", {"item_code": ("like", "EDIA-%")}), 0)
+
+	def test_edited_import_file_carries_the_source_settings(self):
+		from editable_data_import.api import grid_data
+
+		self.cleanup_items("EDIN")
+		data_import, _ = self.make_import("edin.csv", csv_content(self.simple_rows("EDIN", 2)))
+
+		source = grid_data.read_source_file(data_import)
+		edited = grid_data.build_edited_import_file(data_import, {"0": {1: "Clone Check"}}, source=source)
+
+		self.assertIsNot(edited, source)
+		for attribute in (
+			"value_lookup",
+			"reference_doctype",
+			"column_to_date_format_map",
+			"tree_parent_overrides",
+			"custom_delimiters",
+			"delimiter_options",
+		):
+			self.assertEqual(
+				getattr(edited, attribute), getattr(source, attribute), msg=f"{attribute} was not carried over"
+			)
+
+		# The clone must not have appended its findings to the source's list.
+		self.assertEqual(edited.data[0].as_list()[1], "Clone Check")
+		self.assertEqual(source.data[0].as_list()[1], "Original 1")
+
+	def test_cleanup_leaves_another_documents_attachment_alone(self):
+		"""Frappe de-duplicates content, so one file_url can belong to two documents."""
+		self.cleanup_items("EDIF")
+		rows = csv_content(self.simple_rows("EDIF", 2))
+		data_import, _ = self.make_import("edif.csv", rows)
+
+		editable_import.save_edits(data_import.name, json.dumps({"0": {"1": "First Save"}}))
+		data_import.reload()
+		derived = data_import.edi_derived_import_file
+
+		# A second Data Import that happens to share the derived file's URL.
+		other = frappe.new_doc("Data Import")
+		other.reference_doctype = "Item"
+		other.import_type = "Insert New Records"
+		other.insert()
+		bystander = frappe.get_doc(
+			{
+				"doctype": "File",
+				"file_url": derived,
+				"file_name": "shared-url.csv",
+				"attached_to_doctype": "Data Import",
+				"attached_to_name": other.name,
+				"is_private": 1,
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.commit()
+
+		editable_import.save_edits(data_import.name, json.dumps({"0": {"1": "Second Save"}}))
+
+		self.assertTrue(frappe.db.exists("File", bystander.name))
+
+	def test_blocking_count_matches_core_for_a_skipped_row(self):
+		"""A warning on a skipped row does not block the real import, so it must not block here."""
+		from frappe.core.doctype.data_import.value_mapping import get_blocking_warnings
+
+		from editable_data_import.api import grid_data
+
+		self.cleanup_items("EDIK")
+		rows = self.simple_rows("EDIK", 2)
+		rows[1][2] = "NO_SUCH_ITEM_GROUP"
+		data_import, _ = self.make_import("edik.csv", csv_content(rows))
+
+		# Row 2 of the sheet is the offending row; skipping it clears core's gate.
+		data_import.append("skipped_rows", {"row_number": 2, "row_data": json.dumps(rows[1])})
+		data_import.save()
+		frappe.db.commit()
+
+		import_file = grid_data.read_source_file(data_import)
+		columns = grid_data.serialise_columns(import_file)
+		report = validation.analyse(data_import, import_file, columns)
+
+		core_blocking = get_blocking_warnings(
+			grid_data.read_source_file(data_import).get_all_warnings(), import_file, data_import
+		)
+		self.assertEqual(report["blocking_count"], len(core_blocking))
+		self.assertEqual(report["blocking_count"], 0)
+
+	def test_a_new_upload_resets_the_edit_bookkeeping(self):
+		"""Revert must never restore a file the user has already replaced."""
+		self.cleanup_items("EDIU")
+		data_import, file_a = self.make_import("ediu-a.csv", csv_content(self.simple_rows("EDIU", 2)))
+
+		editable_import.save_edits(data_import.name, json.dumps({"0": {"1": "Edit Against A"}}))
+		data_import.reload()
+		self.assertEqual(data_import.edi_original_import_file, file_a.file_url)
+
+		# The user uploads a different file, exactly as the form's attach field does.
+		file_b = save_file(
+			"ediu-b.csv",
+			csv_content(self.simple_rows("EDIUB", 2)),
+			"Data Import",
+			data_import.name,
+			is_private=1,
+			df="import_file",
+		)
+		data_import.import_file = file_b.file_url
+		data_import.save()
+		frappe.db.commit()
+
+		with self.assertRaises(frappe.ValidationError):
+			editable_import.revert_edits(data_import.name)
+
+		data_import.reload()
+		self.assertEqual(data_import.import_file, file_b.file_url)
+		self.assertFalse(data_import.edi_original_import_file)
+
+		# Editing B now records B as the original, not A.
+		editable_import.save_edits(data_import.name, json.dumps({"0": {"1": "Edit Against B"}}))
+		data_import.reload()
+		self.assertEqual(data_import.edi_original_import_file, file_b.file_url)
+
+		editable_import.revert_edits(data_import.name)
+		data_import.reload()
+		self.assertEqual(data_import.import_file, file_b.file_url)
+
+	def test_a_finished_import_cannot_be_rewritten(self):
+		self.cleanup_items("EDIZ")
+		data_import, _ = self.make_import("ediz.csv", csv_content(self.simple_rows("EDIZ", 1)))
+		data_import.db_set("status", "Success")
+		data_import.reload()
+
+		with self.assertRaises(frappe.ValidationError):
+			editable_import.save_edits(data_import.name, json.dumps({"0": {"1": "Too Late"}}))
+
+	def test_page_limit_is_capped(self):
+		from editable_data_import.api import grid_data
+
+		self.cleanup_items("EDIL")
+		data_import, _ = self.make_import("edil.csv", csv_content(self.simple_rows("EDIL", 3)))
+
+		preview = editable_import.get_editable_preview(data_import.name, limit=10**9)
+
+		self.assertEqual(preview["limit"], grid_data.get_max_editable_rows())

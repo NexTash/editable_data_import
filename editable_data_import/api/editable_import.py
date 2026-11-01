@@ -28,6 +28,20 @@ def _parse_edits(edits) -> dict:
 	return parsed
 
 
+def _page_limit(limit) -> int:
+	"""A page size the caller cannot use to ask for an unbounded payload.
+
+	``limit`` arrives from a whitelisted endpoint, so the configured maximum is a
+	ceiling rather than just a default - otherwise one request could serialise an
+	entire multi-hundred-thousand-row file into a single response.
+	"""
+	maximum = grid_data.get_max_editable_rows()
+	requested = frappe.utils.cint(limit)
+	if requested <= 0:
+		return maximum
+	return min(requested, maximum)
+
+
 def _editable_state(doc, import_file) -> dict:
 	total_rows = len(import_file.data)
 	max_rows = grid_data.get_max_editable_rows()
@@ -60,8 +74,8 @@ def get_editable_preview(data_import: str, start: int = 0, limit: int | None = N
 	import_file = grid_data.read_source_file(doc)
 	columns = grid_data.serialise_columns(import_file)
 
-	start = frappe.utils.cint(start)
-	limit = frappe.utils.cint(limit) or grid_data.get_max_editable_rows()
+	start = max(0, frappe.utils.cint(start))
+	limit = _page_limit(limit)
 
 	structure = grid_data.get_row_structure(import_file)
 	payload = {
@@ -104,23 +118,30 @@ def validate_edits(data_import: str, edits=None, deep: int = 0):
 	can iterate on corrections without producing a file per attempt.
 	"""
 	doc = _get_doc(data_import)
-	doc.check_permission("read")
+	deep = bool(frappe.utils.cint(deep))
+
+	# Deep validation replays real inserts, so it runs the reference doctype's
+	# validate() hooks and anything they trigger. That is a write-shaped
+	# operation even though every row is rolled back, so it asks for write
+	# permission rather than the read permission a plain preview needs.
+	doc.check_permission("write" if deep else "read")
 
 	edits = _parse_edits(edits)
 	source = grid_data.read_source_file(doc)
-	columns = grid_data.serialise_columns(source)
 
 	edited = grid_data.build_edited_import_file(doc, edits, source=source)
 	if edited is source:
 		# No edits: re-read so analyse() gets an ImportFile whose payloads have
 		# not already been parsed.
 		edited = grid_data.read_source_file(doc)
-		columns = grid_data.serialise_columns(edited)
+
+	# Serialised from the edited file, not the source: an edit can change a
+	# column's guessed date format, and the grid must render the headers the
+	# edited dataset was actually parsed under.
+	columns = grid_data.serialise_columns(edited)
 
 	try:
-		result = validation.analyse(
-			doc, edited, columns, deep=bool(frappe.utils.cint(deep))
-		)
+		result = validation.analyse(doc, edited, columns, deep=deep)
 	finally:
 		# Deep validation replays real inserts inside savepoints. Those are
 		# rolled back individually; this is the belt-and-braces guarantee that

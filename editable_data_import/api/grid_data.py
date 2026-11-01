@@ -8,17 +8,21 @@ The only capability core does not offer is building an ``ImportFile`` from rows
 that exist in a browser rather than in a file, because its ``__init__`` always
 reads from a File document, a filesystem path or a Google Sheet.
 
-``InMemoryImportFile`` closes exactly that one gap and nothing else: it
-reproduces the attribute set core's ``__init__`` builds and then hands over to
-the inherited ``parse_data_from_template``. Header, Column and Row behaviour,
-date-format guessing, warning collection and payload grouping therefore remain
-byte-for-byte the stock implementation, which is what keeps this app cheap to
-carry across Frappe upgrades.
+``reparse_with_raw_data`` closes exactly that one gap and nothing else. It does
+so by *cloning* an ImportFile core itself constructed and swapping only
+``raw_data`` before re-parsing, rather than by re-listing the attributes core's
+``__init__`` sets. That matters: core's ``__init__`` grew ``value_lookup``,
+``reference_doctype``, ``column_to_date_format_map`` and
+``tree_parent_overrides``, every one of which ``parse_data_from_template`` reads.
+A hand-maintained attribute list silently falls behind on upgrade and surfaces
+as an AttributeError mid-parse; copying ``__dict__`` carries new attributes over
+for free. Header, Column and Row behaviour, date-format guessing, warning
+collection and payload grouping therefore remain byte-for-byte the stock
+implementation.
 """
 
 import frappe
-from frappe import _
-from frappe.core.doctype.data_import.importer import INVALID_VALUES, ImportFile, Importer
+from frappe.core.doctype.data_import.importer import INVALID_VALUES, Importer, ImportFile
 
 # The stock preview ships 10 rows. That limit is a payload-size guard, not a
 # rendering guard - frappe-datatable virtualises rows through HyperList, so the
@@ -39,35 +43,31 @@ def get_max_editable_rows() -> int:
 	return configured if configured > 0 else DEFAULT_MAX_EDITABLE_ROWS
 
 
-class InMemoryImportFile(ImportFile):
-	"""An ImportFile whose raw rows are supplied directly instead of read from disk."""
+def reparse_with_raw_data(source: ImportFile, raw_data: list) -> ImportFile:
+	"""A clone of ``source`` that parses ``raw_data`` instead of the file's own rows.
 
-	def __init__(self, doctype, raw_data, template_options=None, import_type=None):
-		self.doctype = doctype
-		self.template_options = frappe._dict(template_options or {})
-		self.template_options.setdefault("column_to_field_map", frappe._dict())
-		self.column_to_field_map = self.template_options.column_to_field_map
-		self.import_type = import_type
-		self.warnings = []
-		self.console = False
-		self.use_sniffer = False
+	Everything core's ``__init__`` configured - the field map, the value-mapping
+	lookup, the reference doctype, per-column date formats, tree overrides,
+	delimiter settings - is carried across verbatim, so the edited dataset is
+	parsed under exactly the settings the real import will use. ``source`` is
+	left untouched.
+	"""
+	edited = ImportFile.__new__(type(source))
+	edited.__dict__.update(source.__dict__)
 
-		# Core's __init__ sets these three before parsing; downstream code reads
-		# them, so they must exist even though nothing was read from a file.
-		self.file_doc = None
-		self.file_path = None
-		self.google_sheets_url = None
+	# Core memoises derivations of the *source* rows on the instance under
+	# underscore-prefixed names (_provider_warnings, _tree_preview_cache). The
+	# clone parses different rows, so every one of them is stale. Dropping the
+	# whole prefix rather than a fixed list keeps a cache added upstream later
+	# from leaking a stale verdict into the edited dataset.
+	for attribute in [key for key in edited.__dict__ if key.startswith("_")]:
+		del edited.__dict__[attribute]
 
-		self.raw_data = raw_data
-		self.parse_data_from_template()
-
-
-def get_template_options(doc) -> dict:
-	"""The saved column_to_field_map for this Data Import, in the shape ImportFile wants."""
-	options = frappe.parse_json(doc.template_options or "{}") or {}
-	options = frappe._dict(options)
-	options.setdefault("column_to_field_map", frappe._dict())
-	return options
+	# Warnings are per-parse; sharing the list would append to source's findings.
+	edited.warnings = []
+	edited.raw_data = raw_data
+	edited.parse_data_from_template()
+	return edited
 
 
 def read_source_file(doc) -> ImportFile:
@@ -81,6 +81,10 @@ def read_source_file(doc) -> ImportFile:
 def normalise_cell(value):
 	"""Match what core's CSV reader produces: trimmed strings, blanks as None."""
 	if value is None:
+		return None
+	if isinstance(value, list | dict | tuple | set):
+		# A grid cell is always a scalar. A container here means a malformed
+		# payload, and writing its repr into the file would corrupt the import.
 		return None
 	if isinstance(value, str):
 		value = value.strip()
@@ -108,6 +112,8 @@ def apply_edits_to_raw_data(import_file: ImportFile, edits: dict) -> list:
 			continue
 		if not (0 <= position < len(import_file.data)):
 			continue
+		if not isinstance(changes, dict):
+			continue
 
 		# Row.index is the index into raw_data, so blank rows and a header that
 		# is not on line one are both handled without any extra bookkeeping.
@@ -116,7 +122,7 @@ def apply_edits_to_raw_data(import_file: ImportFile, edits: dict) -> list:
 		if len(row) < column_count:
 			row.extend([None] * (column_count - len(row)))
 
-		for column_index, value in (changes or {}).items():
+		for column_index, value in changes.items():
 			try:
 				column_index = int(column_index)
 			except (TypeError, ValueError):
@@ -134,12 +140,7 @@ def build_edited_import_file(doc, edits: dict, source: ImportFile | None = None)
 		return source
 
 	raw_data = apply_edits_to_raw_data(source, edits)
-	return InMemoryImportFile(
-		doc.reference_doctype,
-		raw_data,
-		template_options=get_template_options(doc),
-		import_type=doc.import_type,
-	)
+	return reparse_with_raw_data(source, raw_data)
 
 
 def serialise_columns(import_file: ImportFile) -> list:

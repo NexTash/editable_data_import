@@ -61,6 +61,12 @@ function edi_py_format_to_moment(format) {
 
 const EDI_SYSTEM_FORMATS = { Date: "YYYY-MM-DD", Datetime: "YYYY-MM-DD HH:mm:ss", Time: "HH:mm:ss" };
 
+// Mirrors LOCKED_STATUSES in api/file_writer.py. A running import must not have
+// the file swapped under it, and a finished one has to keep the file its Data
+// Import Log points at - so the server refuses both, and the UI must not offer
+// actions that can only end in that refusal.
+const EDI_LOCKED_STATUSES = ["In Progress", "Success"];
+
 frappe.editable_data_import.EditablePreview = class EditablePreview {
 	constructor({ wrapper, frm, payload, events = {} }) {
 		edi_inject_styles();
@@ -222,6 +228,11 @@ frappe.editable_data_import.EditablePreview = class EditablePreview {
 	 * recognises it as a child row. Filling one in would silently split the
 	 * document in two, so those cells are locked rather than merely warned about.
 	 */
+	/** False once the file this preview edits is no longer the server's to rewrite. */
+	is_editable() {
+		return !EDI_LOCKED_STATUSES.includes(this.frm.doc.status);
+	}
+
 	is_locked(position, col_index) {
 		const col = this.columns_meta[col_index];
 		if (!col || !col.df || col.skip_import) return true;
@@ -235,7 +246,7 @@ frappe.editable_data_import.EditablePreview = class EditablePreview {
 		const col = this.columns_meta[col_index];
 
 		if (!col || this.is_locked(position, col_index)) return false;
-		if (this.frm.doc.status === "Success") return false;
+		if (!this.is_editable()) return false;
 
 		const df = Object.assign({}, col.df, {
 			label: col.df.label,
@@ -432,12 +443,23 @@ frappe.editable_data_import.EditablePreview = class EditablePreview {
 		return this.validation ? this.validation.blocking_count || 0 : 0;
 	}
 
+	/**
+	 * Deep-validation failures are counted separately from `blocking_count`,
+	 * because that number has to mean exactly what the server's import gate
+	 * means. They are still real failures, so they get their own tally rather
+	 * than being folded in or quietly dropped.
+	 */
+	deep_error_count() {
+		return this.validation ? this.validation.deep_error_count || 0 : 0;
+	}
+
 	// ---------------------------------------------------------------- toolbar
 
 	render_toolbar() {
+		const editable = this.is_editable();
 		const dirty = this.is_dirty();
 		const blocking = this.blocking_count();
-		const status = this.status_html(dirty, blocking);
+		const status = this.status_html(dirty, blocking, this.deep_error_count());
 
 		const buttons = [
 			{
@@ -455,7 +477,7 @@ frappe.editable_data_import.EditablePreview = class EditablePreview {
 			{
 				label: __("Save Edits"),
 				action: "save_edits",
-				condition: dirty,
+				condition: dirty && editable,
 			},
 			{
 				label: __("Discard Edits"),
@@ -465,12 +487,12 @@ frappe.editable_data_import.EditablePreview = class EditablePreview {
 			{
 				label: __("Revert to Original File"),
 				action: "revert",
-				condition: !dirty && this.payload.has_edits,
+				condition: !dirty && this.payload.has_edits && editable,
 			},
 			{
 				label: __("Map Columns"),
 				action: "map_columns",
-				condition: this.frm.doc.status !== "Success",
+				condition: editable,
 			},
 		];
 
@@ -491,7 +513,7 @@ frappe.editable_data_import.EditablePreview = class EditablePreview {
 		});
 	}
 
-	status_html(dirty, blocking) {
+	status_html(dirty, blocking, deep_errors) {
 		const parts = [];
 
 		if (this.payload.paged) {
@@ -510,6 +532,14 @@ frappe.editable_data_import.EditablePreview = class EditablePreview {
 			parts.push(`<span class="edi-blocking">${__("{0} blocking errors", [blocking])}</span>`);
 		} else if (this.validation) {
 			parts.push(`<span class="edi-clean">${__("No blocking errors")}</span>`);
+		}
+
+		if (deep_errors) {
+			parts.push(
+				`<span class="edi-blocking">${__("{0} rows fail document validation", [
+					deep_errors,
+				])}</span>`
+			);
 		}
 
 		return parts.join(" &middot; ");
@@ -675,11 +705,16 @@ frappe.editable_data_import.EditablePreview = class EditablePreview {
 				if (!response.message) return null;
 				this.set_validation(response.message);
 				const blocking = this.blocking_count();
+				const deep_errors = this.deep_error_count();
+				let message = __("No blocking errors found");
+				if (blocking) {
+					message = __("{0} blocking errors remain", [blocking]);
+				} else if (deep_errors) {
+					message = __("{0} rows fail document validation", [deep_errors]);
+				}
 				frappe.show_alert({
-					message: blocking
-						? __("{0} blocking errors remain", [blocking])
-						: __("No blocking errors found"),
-					indicator: blocking ? "red" : "green",
+					message: message,
+					indicator: blocking || deep_errors ? "red" : "green",
 				});
 				return response.message;
 			});

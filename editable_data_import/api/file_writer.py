@@ -13,7 +13,11 @@ file attached.
 
 The upload the user made is never written to. It is copied aside into
 ``edi_original_import_file`` the first time edits are materialised, so it stays
-available as the reference and the edits can always be reverted.
+available as the reference and the edits can always be reverted. That field
+describes one specific upload, so it is reset as soon as a different file is
+attached - core's ``validate()`` resets its own fields on a new upload but knows
+nothing about these custom ones, and a stale value would make Revert restore the
+file the user had already replaced.
 """
 
 import csv
@@ -27,12 +31,7 @@ from frappe.utils.csvutils import UnicodeWriter, escape_formula_injection
 from frappe.utils.file_manager import save_file
 from frappe.utils.xlsxutils import make_xlsx
 
-from editable_data_import.api.grid_data import (
-	InMemoryImportFile,
-	apply_edits_to_raw_data,
-	get_template_options,
-	read_source_file,
-)
+from editable_data_import.api.grid_data import apply_edits_to_raw_data, read_source_file
 
 GOOGLE_SHEETS_MARKER = "docs.google.com/spreadsheets"
 
@@ -102,22 +101,106 @@ def _derived_filename(doc, extension: str) -> str:
 	return f"{base}-edited-{frappe.generate_hash(length=6)}.{extension}"
 
 
-def _delete_previous_derived_file(doc, keep_url: str | None = None):
-	"""Remove the file produced by the previous save, never the original."""
+def _superseded_derived_file(doc, keep_url: str | None = None) -> str | None:
+	"""The working file from a previous save that this one replaces, if any."""
 	previous = doc.get("edi_derived_import_file")
 	if not previous or previous == keep_url:
-		return
+		return None
+	# Never the upload itself, whatever the bookkeeping says.
 	if previous == doc.get("edi_original_import_file"):
+		return None
+	return previous
+
+
+def _drop_derived_file(doc, file_url: str | None):
+	"""Delete a superseded working file - and only once its replacement is durable.
+
+	Call order is the whole point. ``File.on_trash`` unlinks the blob from disk
+	immediately and no rollback can put it back, while the File row's own DELETE
+	is transactional. Deleting before the swap is committed therefore risks the
+	worst of both: a later failure rolls the row back into existence, the content
+	is gone for good, and ``import_file`` still points at it. That leaves a Data
+	Import whose file cannot be read - and because Frappe de-duplicates
+	attachments by content hash, the *next* save of identical content inherits
+	the same dead URL instead of writing a fresh blob.
+
+	The lookup is also restricted to attachments of *this* Data Import. A
+	``file_url`` is not an identity: that same de-duplication means two File
+	records on two different documents can carry one URL, and a bare
+	``{"file_url": ...}`` filter plus ``ignore_permissions`` would delete
+	whichever the database returned first - possibly somebody else's attachment.
+	"""
+	if not file_url:
 		return
 
-	name = frappe.db.get_value("File", {"file_url": previous})
-	if not name:
-		return
-	try:
-		frappe.delete_doc("File", name, ignore_permissions=True, delete_permanently=True)
-	except Exception:
-		# A superseded working file is not worth failing a save over.
-		frappe.log_error("Editable Data Import: could not remove superseded file")
+	names = frappe.get_all(
+		"File",
+		filters={
+			"file_url": file_url,
+			"attached_to_doctype": doc.doctype,
+			"attached_to_name": doc.name,
+		},
+		pluck="name",
+	)
+	for name in names:
+		try:
+			frappe.delete_doc("File", name, ignore_permissions=True, delete_permanently=True)
+			frappe.db.commit()
+		except Exception:
+			# A superseded working file is not worth failing a save over.
+			frappe.db.rollback()
+			frappe.log_error("Editable Data Import: could not remove superseded file")
+
+
+# An import that is running must not have the file swapped under it, and a
+# finished one must keep the file its Data Import Log refers to. Partial Success
+# and Error are deliberately absent: fixing the rows and retrying is the whole
+# point of the feature.
+LOCKED_STATUSES = ("In Progress", "Success")
+
+
+def _assert_editable(doc):
+	if doc.status in LOCKED_STATUSES:
+		frappe.throw(
+			_("This import is {0}; its file can no longer be edited.").format(frappe.bold(_(doc.status))),
+			title=_("Import Not Editable"),
+		)
+
+
+def current_source(doc) -> str | None:
+	"""The input ``Importer`` will actually read, in the order it prefers them."""
+	return doc.google_sheets_url or doc.import_file
+
+
+def reset_stale_bookkeeping(doc) -> bool:
+	"""Forget the previous edit session when the uploaded source has been replaced.
+
+	``edi_original_import_file`` describes one specific upload. Attaching a new
+	file does not clear it - core's ``validate()`` resets ``template_options``
+	and friends, but knows nothing about these custom fields - so without this
+	the next save would keep file A on record as "the original" while the user is
+	editing file B, and Revert would restore A over B.
+
+	Returns True when a reset happened.
+	"""
+	original = doc.get("edi_original_import_file")
+	if not original:
+		return False
+
+	source = current_source(doc)
+	if not source or source in (original, doc.get("edi_derived_import_file")):
+		return False
+
+	# The derived file belongs to the abandoned session, not this one - but the
+	# record of it goes first, so a failure can never leave the doc pointing at
+	# a file whose content has already been unlinked.
+	superseded = _superseded_derived_file(doc)
+	for field in ("edi_original_import_file", "edi_derived_import_file"):
+		doc.db_set(field, None, update_modified=False)
+	frappe.db.commit()
+
+	_drop_derived_file(doc, superseded)
+	return True
 
 
 def build_edited_rows(import_file: ImportFile, edits: dict) -> list:
@@ -135,6 +218,8 @@ def materialise(doc, edits: dict, source: ImportFile | None = None) -> dict:
 	an edit.
 	"""
 	doc.check_permission("write")
+	_assert_editable(doc)
+	reset_stale_bookkeeping(doc)
 
 	source = source or read_source_file(doc)
 	rows = build_edited_rows(source, edits)
@@ -152,7 +237,7 @@ def materialise(doc, edits: dict, source: ImportFile | None = None) -> dict:
 	original = doc.get("edi_original_import_file")
 	if not original:
 		# First materialisation: remember where the data actually came from.
-		original = doc.google_sheets_url or doc.import_file
+		original = current_source(doc)
 
 	file_doc = save_file(
 		_derived_filename(doc, extension),
@@ -163,10 +248,18 @@ def materialise(doc, edits: dict, source: ImportFile | None = None) -> dict:
 		df="import_file",
 	)
 
-	_delete_previous_derived_file(doc, keep_url=file_doc.file_url)
+	# Captured before the db_set loop below overwrites the field.
+	superseded = _superseded_derived_file(doc, keep_url=file_doc.file_url)
 
 	# Re-parse what was actually written, so payload_count and the returned
 	# row count describe the file on disk rather than what we believe we wrote.
+	#
+	# google_sheets_url has to be stood down *before* that re-parse, not just in
+	# the database afterwards: it outranks import_file inside Importer.__init__,
+	# so leaving it set would make the verification read the sheet again - and
+	# would make the import itself discard every edit.
+	was_google_sheet = bool(doc.google_sheets_url)
+	doc.google_sheets_url = None
 	doc.import_file = file_doc.file_url
 	verified = read_source_file(doc)
 
@@ -178,10 +271,7 @@ def materialise(doc, edits: dict, source: ImportFile | None = None) -> dict:
 		"payload_count": len(verified.get_payloads_for_import()),
 	}
 
-	# A Google Sheets import outranks import_file inside Importer.__init__, so
-	# it has to be stood down or the import would quietly read the sheet again
-	# and discard every edit.
-	if doc.google_sheets_url:
+	if was_google_sheet:
 		updates["google_sheets_url"] = None
 
 	for field, value in updates.items():
@@ -198,6 +288,9 @@ def materialise(doc, edits: dict, source: ImportFile | None = None) -> dict:
 	# durable regardless of what the import then does.
 	frappe.db.commit()
 
+	# Only now, with the new file on record, is losing the old one harmless.
+	_drop_derived_file(doc, superseded)
+
 	return {
 		"import_file": file_doc.file_url,
 		"file_name": file_doc.file_name,
@@ -211,12 +304,17 @@ def materialise(doc, edits: dict, source: ImportFile | None = None) -> dict:
 def revert_to_original(doc) -> dict:
 	"""Put the untouched upload back in place and drop the edited file."""
 	doc.check_permission("write")
+	_assert_editable(doc)
+
+	# A new upload makes the recorded original stale; restoring it would put the
+	# *previous* file back over the one the user just attached.
+	reset_stale_bookkeeping(doc)
 
 	original = doc.get("edi_original_import_file")
 	if not original:
 		frappe.throw(_("This Data Import has no edited version to revert."))
 
-	_delete_previous_derived_file(doc)
+	superseded = _superseded_derived_file(doc)
 
 	updates = {
 		"edi_derived_import_file": None,
@@ -233,6 +331,11 @@ def revert_to_original(doc) -> dict:
 
 	for field, value in updates.items():
 		doc.db_set(field, value, update_modified=True)
+
+	# The restore has to be durable before the edited file is unlinked; see
+	# _drop_derived_file() for what deleting first would cost.
+	frappe.db.commit()
+	_drop_derived_file(doc, superseded)
 
 	doc.reload()
 	restored = read_source_file(doc)

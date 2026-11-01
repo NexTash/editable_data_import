@@ -126,19 +126,41 @@ frappe.ui.form.on("Data Import", {
 				if (!result) return;
 
 				if (!result.started && result.reason === "validation") {
-					if (preview) {
-						preview.edits = {};
-						preview.set_validation(result.validation);
-					}
 					edi_set_unload_guard(false);
-					frappe.msgprint({
-						title: __("Cannot Start Import"),
-						indicator: "red",
-						message: __(
-							"{0} blocking errors must be corrected in the preview before importing.",
-							[result.validation.blocking_count]
-						),
-					});
+
+					const explain = () =>
+						frappe.msgprint({
+							title: __("Cannot Start Import"),
+							indicator: "red",
+							message: __(
+								"{0} blocking errors must be corrected in the preview before importing.",
+								[result.validation.blocking_count]
+							),
+						});
+
+					if (!preview) {
+						explain();
+						return;
+					}
+
+					// The edits were written to the file before validation ran, so
+					// they are no longer "unsaved" - but `payload.rows` still holds
+					// the values from before the save. Dropping `edits` and
+					// re-rendering off that stale payload would show the user their
+					// old, wrong values while the saved file holds the corrected
+					// ones. Reload the page from the server instead, which brings
+					// back both the saved rows and validation against them.
+					preview.edits = {};
+					if (result.saved) {
+						// Deliberately not frm.reload_doc(): import_file changed, so
+						// core's refresh would see a new source key and kick off its
+						// own preview fetch, which ends in a second, racing rebuild
+						// of this grid. load_page() is the deterministic refresh.
+						return preview.load_page(preview.payload.start || 0).then(explain);
+					}
+
+					preview.set_validation(result.validation);
+					explain();
 					return;
 				}
 
